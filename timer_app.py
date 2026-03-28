@@ -124,12 +124,12 @@ class TimerApp:
         self.timer_canvas.place(x=0, y=0)
         self.timer_canvas.bind("<Button-1>", self._on_timer_click)
 
-        # タイマーテキスト（イタリック太字）
+        # タイマーテキスト（太字）
         self.timer_text = self.timer_canvas.create_text(
             timer_width // 2,
             self.HEIGHT // 2 - 10,
             text="05:00",
-            font=("Helvetica", 150, "bold italic"),
+            font=("DejaVu Sans", 150, "bold"),
             fill=self.COLOR_TIMER_NORMAL
         )
 
