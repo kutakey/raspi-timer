@@ -23,6 +23,14 @@ except ImportError:
     PYGAME_AVAILABLE = False
     print("WARNING: pygame not available. Alarm sound disabled.")
 
+# GPIO初期化（物理ボタン用）
+try:
+    from gpiozero import Button as GPIOButton
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+    print("WARNING: gpiozero not available. GPIO button disabled.")
+
 
 class TimerApp:
     # カラー定義
@@ -73,6 +81,12 @@ class TimerApp:
         # UI構築
         self._build_ui()
         self._update_display()
+
+        # GPIO物理ボタン（GPIO17）
+        self.gpio_button = None
+        if GPIO_AVAILABLE:
+            self.gpio_button = GPIOButton(17, pull_up=True)
+            self.gpio_button.when_pressed = lambda: self.root.after(0, self._on_timer_click, None)
 
     def _generate_alarm_sound(self):
         """ビープ音を動的生成"""
