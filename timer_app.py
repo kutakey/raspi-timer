@@ -38,9 +38,9 @@ class TimerApp:
     COLOR_SLIDER_FILL = "#4A90D9"
     COLOR_SLIDER_KNOB = "#FFFFFF"
 
-    # 画面サイズ
-    WIDTH = 800
-    HEIGHT = 480
+    # 画面サイズ（Raspberry Pi Touch Display 2: 1280x720）
+    WIDTH = 1280
+    HEIGHT = 720
 
     # ボタン幅
     BTN_WIDTH = 120
@@ -129,7 +129,7 @@ class TimerApp:
             timer_width // 2,
             self.HEIGHT // 2 - 10,
             text="05:00",
-            font=("DejaVu Sans", 150, "bold"),
+            font=("DejaVu Sans", 220, "bold"),
             fill=self.COLOR_TIMER_NORMAL
         )
 
