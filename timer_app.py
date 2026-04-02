@@ -314,8 +314,13 @@ class TimerApp:
     def _update_btn_state(self):
         """タイマー動作中・アラーム中は↑↓ボタンを無効化（グレーアウト）"""
         disabled = self.running or self.alarming
-        for btn in self.arrow_buttons:
-            btn.configure(state=tk.DISABLED if disabled else tk.NORMAL)
+        for btn, normal_color in [
+            (self.up_min_canvas, self.COLOR_UP_BTN),
+            (self.down_min_canvas, self.COLOR_DOWN_BTN),
+            (self.up_sec_canvas, self.COLOR_UP_BTN),
+            (self.down_sec_canvas, self.COLOR_DOWN_BTN),
+        ]:
+            btn.configure(bg=self.COLOR_BTN_DISABLED if disabled else normal_color)
 
     def _on_timer_click(self, event):
         """タイマーエリアクリック"""
