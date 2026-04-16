@@ -13,6 +13,7 @@ import wave
 import io
 import os
 import tempfile
+import time
 
 # pygame初期化（アラーム音用）
 try:
@@ -75,6 +76,10 @@ class TimerApp:
         self.volume_slider_open = False
         self.slider_dragging = False
 
+        # タップ/ボタン連打防止（ms）
+        self._last_toggle_ms = 0
+        self._toggle_cooldown_ms = 300
+
         # アラーム音生成
         self.alarm_sound = None
         if PYGAME_AVAILABLE:
@@ -85,32 +90,46 @@ class TimerApp:
         self._update_display()
 
         # GPIO物理ボタン（GPIO17）
+        # bounce_time でチャタリング対策（50ms以内の連続パルスを無視）
         self.gpio_button = None
         if GPIO_AVAILABLE:
-            self.gpio_button = GPIOButton(17, pull_up=True)
-            self.gpio_button.when_pressed = lambda: self.root.after(0, self._on_timer_click, None)
+            self.gpio_button = GPIOButton(17, pull_up=True, bounce_time=0.05)
+            self.gpio_button.when_pressed = lambda: self.root.after(0, self._on_startstop_click, None)
 
     def _generate_alarm_sound(self):
-        """ビープ音を動的生成"""
-        sample_rate = 44100
-        duration = 0.5  # 秒
-        frequency = 1000  # Hz
-        n_samples = int(sample_rate * duration)
+        """キッチンタイマー風「ピピピピピ」音を動的生成
 
-        # ビープ音波形生成
+        1サイクル = ビープ100ms + 無音100ms。これをループ再生することで
+        毎秒約5発の「ピ・ピ・ピ・ピ・ピ」が連続する。
+        """
+        sample_rate = 44100
+        frequency = 2500       # Hz: 鋭い「ピ」音
+        beep_ms = 100          # ビープ長
+        gap_ms = 100           # 無音
+        fade_samples = 80      # ループ境界のクリックノイズ防止用フェード
+
+        beep_samples = int(sample_rate * beep_ms / 1000)
+        gap_samples = int(sample_rate * gap_ms / 1000)
+        n_samples = beep_samples + gap_samples
+
+        # ビープ + 無音の1サイクル波形生成
         buf = io.BytesIO()
         with wave.open(buf, 'w') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             for i in range(n_samples):
-                t = i / sample_rate
-                envelope = 1.0
-                if i < 500:
-                    envelope = i / 500.0
-                elif i > n_samples - 500:
-                    envelope = (n_samples - i) / 500.0
-                value = int(32767 * envelope * math.sin(2 * math.pi * frequency * t))
+                if i < beep_samples:
+                    if i < fade_samples:
+                        envelope = i / fade_samples
+                    elif i > beep_samples - fade_samples:
+                        envelope = (beep_samples - i) / fade_samples
+                    else:
+                        envelope = 1.0
+                    t = i / sample_rate
+                    value = int(32767 * envelope * math.sin(2 * math.pi * frequency * t))
+                else:
+                    value = 0
                 wf.writeframes(struct.pack('<h', value))
 
         buf.seek(0)
@@ -119,6 +138,8 @@ class TimerApp:
         self._temp_sound_file.write(buf.read())
         self._temp_sound_file.flush()
         self.alarm_sound = pygame.mixer.Sound(self._temp_sound_file.name)
+        # 初期音量を反映
+        self.alarm_sound.set_volume(self.volume / 100.0)
 
     def _build_ui(self):
         """UIを構築"""
@@ -126,30 +147,29 @@ class TimerApp:
         self.main_frame = tk.Frame(self.root, bg=self.COLOR_BG)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
 
-        timer_area_width = self.WIDTH - self.VOL_BTN_WIDTH
+        # レイアウト計算（セットアップ/ランニング両方で使用）
+        self._timer_area_width = self.WIDTH - self.VOL_BTN_WIDTH
+        self._center_x = self._timer_area_width // 2
+        self._margin = 40  # 左・中央・右すべて同じ間隔
+        self._btn_w = (self._timer_area_width - 3 * self._margin) // 2
+        self._btn_h = 180
+        self._min_col_x = self._margin + self._btn_w // 2
+        self._sec_col_x = self._margin + self._btn_w + self._margin + self._btn_w // 2
+        self._right_half_h = self.HEIGHT // 2  # 音量/SS ボタン高さ
 
         # タイマー表示エリア（タッチでスタート/ストップ）
         self.timer_canvas = tk.Canvas(
             self.main_frame,
-            width=timer_area_width,
+            width=self._timer_area_width,
             height=self.HEIGHT,
             bg=self.COLOR_BG,
             highlightthickness=0
         )
-        self.timer_canvas.place(x=0, y=0)
         self.timer_canvas.bind("<Button-1>", self._on_timer_click)
-
-        # レイアウト計算
-        center_x = timer_area_width // 2
-        btn_w = 160
-        btn_h = 140
-        col_spacing = 220  # 分と秒の列間隔
-        min_col_x = center_x - col_spacing // 2
-        sec_col_x = center_x + col_spacing // 2
 
         # タイマーテキスト（中央）
         self.timer_text = self.timer_canvas.create_text(
-            center_x,
+            self._center_x,
             self.HEIGHT // 2,
             text="05:00",
             font=("DejaVu Sans", 200, "bold"),
@@ -158,38 +178,34 @@ class TimerApp:
 
         # ↑分ボタン
         self.up_min_canvas = tk.Canvas(
-            self.main_frame, width=btn_w, height=btn_h,
+            self.main_frame, width=self._btn_w, height=self._btn_h,
             bg=self.COLOR_UP_BTN, highlightthickness=0
         )
-        self.up_min_canvas.place(x=min_col_x - btn_w // 2, y=20)
-        self._draw_arrow_up(self.up_min_canvas, btn_w, btn_h)
+        self._draw_arrow_up(self.up_min_canvas, self._btn_w, self._btn_h)
         self.up_min_canvas.bind("<Button-1>", self._on_up_min)
 
         # ↓分ボタン
         self.down_min_canvas = tk.Canvas(
-            self.main_frame, width=btn_w, height=btn_h,
+            self.main_frame, width=self._btn_w, height=self._btn_h,
             bg=self.COLOR_DOWN_BTN, highlightthickness=0
         )
-        self.down_min_canvas.place(x=min_col_x - btn_w // 2, y=self.HEIGHT - btn_h - 20)
-        self._draw_arrow_down(self.down_min_canvas, btn_w, btn_h)
+        self._draw_arrow_down(self.down_min_canvas, self._btn_w, self._btn_h)
         self.down_min_canvas.bind("<Button-1>", self._on_down_min)
 
         # ↑秒ボタン
         self.up_sec_canvas = tk.Canvas(
-            self.main_frame, width=btn_w, height=btn_h,
+            self.main_frame, width=self._btn_w, height=self._btn_h,
             bg=self.COLOR_UP_BTN, highlightthickness=0
         )
-        self.up_sec_canvas.place(x=sec_col_x - btn_w // 2, y=20)
-        self._draw_arrow_up(self.up_sec_canvas, btn_w, btn_h)
+        self._draw_arrow_up(self.up_sec_canvas, self._btn_w, self._btn_h)
         self.up_sec_canvas.bind("<Button-1>", self._on_up_sec)
 
         # ↓秒ボタン
         self.down_sec_canvas = tk.Canvas(
-            self.main_frame, width=btn_w, height=btn_h,
+            self.main_frame, width=self._btn_w, height=self._btn_h,
             bg=self.COLOR_DOWN_BTN, highlightthickness=0
         )
-        self.down_sec_canvas.place(x=sec_col_x - btn_w // 2, y=self.HEIGHT - btn_h - 20)
-        self._draw_arrow_down(self.down_sec_canvas, btn_w, btn_h)
+        self._draw_arrow_down(self.down_sec_canvas, self._btn_w, self._btn_h)
         self.down_sec_canvas.bind("<Button-1>", self._on_down_sec)
 
         # ボタン参照リスト（有効/無効切り替え用）
@@ -198,17 +214,27 @@ class TimerApp:
             self.up_sec_canvas, self.down_sec_canvas
         ]
 
-        # 音量ボタン（右端、縦全体）
+        # 音量ボタン（右端、上半分）
         self.vol_canvas = tk.Canvas(
             self.main_frame,
             width=self.VOL_BTN_WIDTH,
-            height=self.HEIGHT,
+            height=self._right_half_h,
             bg=self.COLOR_VOLUME_BTN,
             highlightthickness=0
         )
-        self.vol_canvas.place(x=self.WIDTH - self.VOL_BTN_WIDTH, y=0)
-        self._draw_speaker_icon(self.vol_canvas, self.VOL_BTN_WIDTH, self.HEIGHT)
+        self._draw_speaker_icon(self.vol_canvas, self.VOL_BTN_WIDTH, self._right_half_h)
         self.vol_canvas.bind("<Button-1>", self._on_volume_btn)
+
+        # スタート/ストップボタン（右端、下半分）
+        self.startstop_canvas = tk.Canvas(
+            self.main_frame,
+            width=self.VOL_BTN_WIDTH,
+            height=self._right_half_h,
+            bg=self.COLOR_UP_BTN,
+            highlightthickness=0
+        )
+        self._draw_startstop_icon(self.startstop_canvas, self.VOL_BTN_WIDTH, self._right_half_h, running=False)
+        self.startstop_canvas.bind("<Button-1>", self._on_startstop_click)
 
         # 音量スライダーオーバーレイ（初期非表示）
         self.slider_frame = tk.Frame(self.main_frame, bg=self.COLOR_SLIDER_BG, bd=2, relief=tk.RAISED)
@@ -223,17 +249,74 @@ class TimerApp:
         self.slider_canvas.bind("<Button-1>", self._on_slider_click)
         self.slider_canvas.bind("<B1-Motion>", self._on_slider_drag)
 
+        # 初期表示 = セットアップ画面
+        self._show_setup_view()
+
+    def _show_setup_view(self):
+        """セットアップ画面: ↑↓ボタンと音量/スタートボタンをすべて表示"""
+        # タイマーキャンバスを元のサイズ（右側ボタン分を残す）に
+        self.timer_canvas.place(x=0, y=0, width=self._timer_area_width, height=self.HEIGHT)
+        self.timer_canvas.configure(width=self._timer_area_width)
+        self.timer_canvas.coords(self.timer_text, self._center_x, self.HEIGHT // 2)
+        self.timer_canvas.itemconfig(self.timer_text, font=("DejaVu Sans", 200, "bold"))
+
+        # 4つの↑↓ボタンを再配置
+        self.up_min_canvas.place(x=self._min_col_x - self._btn_w // 2, y=20)
+        self.down_min_canvas.place(x=self._min_col_x - self._btn_w // 2, y=self.HEIGHT - self._btn_h - 20)
+        self.up_sec_canvas.place(x=self._sec_col_x - self._btn_w // 2, y=20)
+        self.down_sec_canvas.place(x=self._sec_col_x - self._btn_w // 2, y=self.HEIGHT - self._btn_h - 20)
+
+        # 右側ボタンを再配置
+        self.vol_canvas.place(x=self.WIDTH - self.VOL_BTN_WIDTH, y=0)
+        self.startstop_canvas.place(x=self.WIDTH - self.VOL_BTN_WIDTH, y=self._right_half_h)
+
+    def _show_running_view(self):
+        """カウント中画面: 数字だけ全画面で大きく表示（ボタンは全部非表示）"""
+        # すべてのボタンを隠す
+        for btn in self.arrow_buttons:
+            btn.place_forget()
+        self.vol_canvas.place_forget()
+        self.startstop_canvas.place_forget()
+        if self.volume_slider_open:
+            self._toggle_slider(False)
+
+        # タイマーキャンバスを全画面に広げて、数字を大きく中央配置
+        self.timer_canvas.place(x=0, y=0, width=self.WIDTH, height=self.HEIGHT)
+        self.timer_canvas.configure(width=self.WIDTH)
+        self.timer_canvas.coords(self.timer_text, self.WIDTH // 2, self.HEIGHT // 2)
+        self.timer_canvas.itemconfig(self.timer_text, font=("DejaVu Sans", 320, "bold"))
+
+    def _draw_startstop_icon(self, canvas, w, h, running):
+        """スタート/ストップアイコン（再生三角形 / 停止四角）"""
+        canvas.delete("all")
+        cx, cy = w // 2, h // 2
+        if running:
+            # ストップ: 四角
+            size = 45
+            canvas.create_rectangle(
+                cx - size, cy - size, cx + size, cy + size,
+                fill=self.COLOR_ARROW, outline=self.COLOR_ARROW
+            )
+        else:
+            # スタート: 三角形（右向き）
+            canvas.create_polygon(
+                cx - 28, cy - 50,
+                cx - 28, cy + 50,
+                cx + 50, cy,
+                fill=self.COLOR_ARROW, outline=self.COLOR_ARROW
+            )
+
     def _draw_arrow_up(self, canvas, w, h):
         """↑太い矢印を描画"""
         cx, cy = w // 2, h // 2
         canvas.create_polygon(
-            cx, cy - 30,
-            cx - 28, cy,
-            cx + 28, cy,
+            cx, cy - 67,
+            cx - 63, cy,
+            cx + 63, cy,
             fill=self.COLOR_ARROW, outline=self.COLOR_ARROW
         )
         canvas.create_rectangle(
-            cx - 10, cy, cx + 10, cy + 28,
+            cx - 22, cy, cx + 22, cy + 63,
             fill=self.COLOR_ARROW, outline=self.COLOR_ARROW
         )
 
@@ -241,13 +324,13 @@ class TimerApp:
         """↓太い矢印を描画"""
         cx, cy = w // 2, h // 2
         canvas.create_rectangle(
-            cx - 10, cy - 28, cx + 10, cy,
+            cx - 22, cy - 63, cx + 22, cy,
             fill=self.COLOR_ARROW, outline=self.COLOR_ARROW
         )
         canvas.create_polygon(
-            cx, cy + 30,
-            cx - 28, cy,
-            cx + 28, cy,
+            cx, cy + 67,
+            cx - 63, cy,
+            cx + 63, cy,
             fill=self.COLOR_ARROW, outline=self.COLOR_ARROW
         )
 
@@ -323,23 +406,61 @@ class TimerApp:
             btn.configure(bg=self.COLOR_BTN_DISABLED if disabled else normal_color)
 
     def _on_timer_click(self, event):
-        """タイマーエリアクリック"""
+        """タイマー数字エリアのタッチ: ストップ/アラーム停止のみ（スタートはしない）"""
+        now_ms = int(time.monotonic() * 1000)
+        if now_ms - self._last_toggle_ms < self._toggle_cooldown_ms:
+            return
+        self._last_toggle_ms = now_ms
+
         if self.alarming:
             self._stop_alarm()
             self.remaining_seconds = self.set_minutes * 60 + self.set_seconds
             self.running = False
             self._update_display()
+            self._show_setup_view()
+            self._draw_startstop_icon(self.startstop_canvas, self.VOL_BTN_WIDTH, self._right_half_h, running=False)
             self._update_btn_state()
         elif self.running:
             self.running = False
             if self.timer_id:
                 self.root.after_cancel(self.timer_id)
                 self.timer_id = None
+            self._show_setup_view()
+            self._draw_startstop_icon(self.startstop_canvas, self.VOL_BTN_WIDTH, self._right_half_h, running=False)
+            self._update_btn_state()
+
+        if self.volume_slider_open:
+            self._toggle_slider(False)
+
+    def _on_startstop_click(self, event):
+        """▶/⏹ ボタン: スタート/ストップ両方（GPIOボタンもこちらを使う）"""
+        now_ms = int(time.monotonic() * 1000)
+        if now_ms - self._last_toggle_ms < self._toggle_cooldown_ms:
+            return
+        self._last_toggle_ms = now_ms
+
+        if self.alarming:
+            self._stop_alarm()
+            self.remaining_seconds = self.set_minutes * 60 + self.set_seconds
+            self.running = False
+            self._update_display()
+            self._show_setup_view()
+            self._draw_startstop_icon(self.startstop_canvas, self.VOL_BTN_WIDTH, self._right_half_h, running=False)
+            self._update_btn_state()
+        elif self.running:
+            self.running = False
+            if self.timer_id:
+                self.root.after_cancel(self.timer_id)
+                self.timer_id = None
+            self._show_setup_view()
+            self._draw_startstop_icon(self.startstop_canvas, self.VOL_BTN_WIDTH, self._right_half_h, running=False)
             self._update_btn_state()
         else:
             if self.remaining_seconds > 0:
                 self.running = True
                 self._update_btn_state()
+                self._draw_startstop_icon(self.startstop_canvas, self.VOL_BTN_WIDTH, self._right_half_h, running=True)
+                self._show_running_view()
                 self._tick()
 
         if self.volume_slider_open:
@@ -415,20 +536,13 @@ class TimerApp:
         self._set_system_volume(self.volume)
 
     def _set_system_volume(self, vol):
-        """システム音量を設定"""
-        try:
-            if platform.system() == "Linux":
-                subprocess.run(
-                    ["amixer", "sset", "Master", f"{vol}%"],
-                    capture_output=True, timeout=2
-                )
-            elif platform.system() == "Darwin":
-                subprocess.run(
-                    ["osascript", "-e", f"set volume output volume {vol}"],
-                    capture_output=True, timeout=2
-                )
-        except Exception as e:
-            print(f"Volume control error: {e}")
+        """アラーム音の音量を設定
+
+        MAX98357Aはハードウェア音量を持たず、hifiberry-dacドライバも
+        Master制御を公開しないため、pygame側で音量を制御する。
+        """
+        if PYGAME_AVAILABLE and self.alarm_sound:
+            self.alarm_sound.set_volume(max(0.0, min(1.0, vol / 100.0)))
 
     def _tick(self):
         """毎秒のカウントダウン"""
